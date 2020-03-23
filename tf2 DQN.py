@@ -1,35 +1,25 @@
 import numpy as np
 
-import logging
-#logging.basicConfig(level=logging.DEBUG)
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 import tensorflow as tf
-
-import gym
-import gym_mastermind
+#tf.get_logger().setLevel('ERROR')
 
 from tqdm import tqdm
 
 from collections import deque
 from collections import Counter
+from collections import namedtuple
 
-from timeit import default_timer as timer
+import datetime
 import time
 import random
 
 
-MIN_REWARD = 0.5  # For model save
-
 # Environment settings
-EPISODES = 3000#10_000
+EPISODES = 4000#10_000
 
-# Exploration settings
-epsilon = 1  # not a constant, going to be decayed
-EPSILON_DECAY = 0.99975
-MIN_EPSILON = 0.001
-
-#  Stats settings
-AGGREGATE_STATS_EVERY = 50  # episodes
 
 # For more repetitive results
 random.seed(1)
@@ -55,15 +45,14 @@ class MastermindEnv():
 
     def __init__(self):
         self.code_values = 6
-        self.code_lenght = 2
+        self.code_lenght = 4
         self.feedback_values = 3
         self.guess_max = 12
-
-        self.state = np.full([2,self.guess_max,self.code_lenght], -1, dtype="float64")
 
         self.reward_best = (self.code_lenght*self.feedback_values-1)*3
         self.reward_worst = - (self.code_lenght*self.feedback_values-1)*2
         
+        self.state = None
         self.target = None
         self.guess_count = None
         self.feedback = None
@@ -91,25 +80,29 @@ class MastermindEnv():
 
 
     def step(self, action):
-        self.guess_count += 1
         self.state
         feedback, reward, won = self.__get_observation(action)
+
+        self.state[0,self.guess_count] = action/(self.code_values-1)
+        self.state[1,self.guess_count] = feedback/(self.feedback_values-1)
+
+        self.guess_count += 1
 
         done = won == True or self.guess_count >= self.guess_max
 
         if won:
             reward = self.reward_best
-        elif any(np.array_equal(x, action/(self.code_values-1)) for x in self.state[0]):
-            reward = self.reward_worst
+        #checks for duplicate actions
+        elif np.any(np.all(np.isin(self.state[0][:self.guess_count-1],action/(self.code_values-1)), axis = 1)):
+            reward = -0
 
-        self.state[0,self.guess_count-1] = action/(self.code_values-1)
-        self.state[1,self.guess_count-1] = feedback/(self.feedback_values-1)
         return feedback, reward , won, done
 
 
     def reset(self):
         self.target, _ = self.random_code()
         self.guess_count = 0
+        self.state = np.full([2,self.guess_max,self.code_lenght], -1, dtype="float64")
         self.feedback = np.zeros(self.code_lenght, dtype = int)
         return self.feedback
 
@@ -125,26 +118,38 @@ class MastermindEnv():
         return np.pad(result, [self.code_lenght-len(result),0],constant_values=0)
 
 
-class DQNAgent():
-    def __init__(self, env):
-        self.variables()
+class DoubleDQNAgent():
+    def __init__(self, env, logger):
+        #set training values
+        self.min_replay_mem_size = 1_000
+        self.batch_size = 64
+        self.replay_mem_size = 50_000
+        self.update_target_every = 5
+        self.discount = 0.2
+        self.learning_rate = 0.0001
+        self.epsilon = 1
+        self.EPSILON_DECAY = 0.99975
+        self.MIN_EPSILON = 0.001
 
-        #main model get trained every step
+        #main model
         self.model = self.create_model(env)
 
-        #the predicting model
+        #the future q prediction model
         self.target_model = self.create_model(env)
         self.target_model.set_weights(self.model.get_weights())
 
+        #
         self.replay_memory = deque(maxlen = self.replay_mem_size)
 
         self.target_update_counter = 0
+        #self.tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=logger.train_log_dir.replace("/", "\\")+ "\\fit", histogram_freq=50, )
+
 
 
     def create_model(self, env):
         self.model_name = "f_d128_d256_dout"
         model = tf.keras.models.Sequential()
-        model.add(tf.keras.layers.Flatten(input_shape=(2,env.guess_max,env.code_lenght)))#(2, 12, 4)#(2,env.guess_max,env.size)
+        model.add(tf.keras.layers.Flatten(input_shape=(2,env.guess_max,env.code_lenght)))
         model.add(tf.keras.layers.Dense(2*env.guess_max*env.code_lenght, activation='relu'))
         model.add(tf.keras.layers.Dense(env.code_values**env.code_lenght*2, activation='relu'))
         model.add(tf.keras.layers.Dense(env.code_values**env.code_lenght, activation='linear'))
@@ -155,24 +160,20 @@ class DQNAgent():
 
         return model
 
-    def variables(self):
-        self.min_replay_mem_size = 1_000
-        self.batch_size = 64
-        self.replay_mem_size = 50_000
-        self.update_target_every = 5
-        self.discount = 0.02
-        self.learning_rate = 0.0001
 
-    def save_model(self, file_name = "test_model.h5"):
-        self.model.save(file_name)
-
-    def update_replay_memory(self, transition):
+    def add_to_replay_memory(self, transition):
         self.replay_memory.append(transition)
 
-    def get_qs(self, state):
-        return self.model.predict(np.expand_dims(state, 0))[0]  #np.array(state).reshape(-1, *state.shape)
 
-    def train(self, terminal_state):
+    def get_qs(self, state):
+        """
+        call for with only state
+        returns a list whit q values for that state
+        """
+        return self.model.predict(np.expand_dims(state, 0))[0]
+
+
+    def train(self):
         #create training batch from replay memory
         if len(self.replay_memory) < self.min_replay_mem_size:
             return
@@ -186,6 +187,7 @@ class DQNAgent():
         end_states = np.array([transition[3] for transition in batch])
         future_qs_list = self.target_model.predict(end_states)
 
+        #predict which action to take for the end state (used to calulate future q)
         next_actions = np.argmax(self.model.predict(end_states), axis=1)
 
         #create X,Y for model.fit
@@ -195,8 +197,8 @@ class DQNAgent():
         #fill x and y lists with Q values en states
         for index, (begin_state, action, reward, end_state, done) in enumerate(batch):
             if not done:
-                max_future_q = future_qs_list[index, next_actions[index]]#np.max(future_qs_list[index])
-                new_q = reward + self.discount * max_future_q
+                future_q = future_qs_list[index, next_actions[index]]
+                new_q = reward + self.discount * future_q
             else:
                 new_q = reward
             
@@ -210,30 +212,106 @@ class DQNAgent():
         self.model.fit(np.array(X), np.array(Y),
             batch_size = self.batch_size,
             verbose = 0,
-            shuffle = False,
-            #callbacks =[self.tensorboard]
-            #if terminal_state else None            
+            shuffle = False#,
+            #callbacks=[self.tensorboard_callback]
         )
 
-        #update 
-        if terminal_state:
-            self.target_update_counter += 1
+
+    def end_episode(self):
+        # Decay epsilon
+        self.epsilon = max(self.MIN_EPSILON, self.epsilon*self.EPSILON_DECAY)
 
         #update predicting model every (self.update_target_every) times
+        self.target_update_counter += 1
+
         if self.target_update_counter > self.update_target_every:
             self.target_model.set_weights(self.model.get_weights())
             self.target_update_counter = 0
 
 
+class stats_logger():
+    def __init__(self, training):
+        self.training = training
+        self.model = None
+        self.AGGREGATE_STATS_EVERY = 50
+        self.save_model_path = "E:\IOT python env\AI\code workspace\models"
+        self.train_log_dir = 'E:/IOT python env/AI/code workspace/logs/train/' + datetime.datetime.now().strftime("%m%d-%H%M%S")
+        self.test_log_dir = 'E:/IOT python env/AI/code workspace/logs/test/' + datetime.datetime.now().strftime("%m%d-%H%M%S")
+        self.set_writer(training)
+
+
+
+        self.episode_rewards = []
+        self.end_quess_counts = []
+        self.win_count = []
+        self.step_num = 0
+        self.return_values = namedtuple("return_values", ["average_reward","min_reward","max_reward","average_quess_count","min_quess_count","max_quess_count","winrate"])
+
+
+    def set_model(self, model):
+        self.model = model
+
+
+    def set_writer(self, training):
+        self.training = training
+        if self.training:
+            self.summary_writer = tf.summary.create_file_writer(self.train_log_dir)
+        else:
+            self.summary_writer = tf.summary.create_file_writer(self.test_log_dir)
+
+
+    def update(self,won, reward, quess_count, episode):
+        self.step_num += 1
+        self.episode_rewards.append(reward)
+        self.end_quess_counts.append(quess_count)
+        self.win_count.append(won)
+        if not episode % self.AGGREGATE_STATS_EVERY or episode == 1:
+            self.write_to_file(self.AGGREGATE_STATS_EVERY)
+            if self.training:
+                self.save_model(self.model, self.AGGREGATE_STATS_EVERY)
+
+
+    def __calc_values(self, num_episodes):
+        average_reward = sum(self.episode_rewards[-num_episodes:])/len(self.episode_rewards[-num_episodes:])
+        min_reward = min(self.episode_rewards[-num_episodes:])
+        max_reward = max(self.episode_rewards[-num_episodes:])
+
+        average_quess_count = sum(self.end_quess_counts[-num_episodes:])/len(self.end_quess_counts[-num_episodes:])
+        min_quess_count = min(self.end_quess_counts[-num_episodes:])
+        max_quess_count = max(self.end_quess_counts[-num_episodes:])
+
+        winrate = sum(self.win_count[-num_episodes:])/len(self.win_count[-num_episodes:])
+
+        return self.return_values(average_reward,min_reward,max_reward,average_quess_count,min_quess_count,max_quess_count,winrate)
+
+
+    def write_to_file(self, stat_calc_nm):
+        with self.summary_writer.as_default():
+            values = self.__calc_values(stat_calc_nm)
+            tf.summary.scalar('average_reward', values.average_reward, step=self.step_num)
+            tf.summary.scalar('min_reward', values.min_reward, step=self.step_num)
+            tf.summary.scalar('max_reward', values.max_reward, step=self.step_num)
+            tf.summary.scalar('average_quess_count', values.average_quess_count, step=self.step_num)
+            tf.summary.scalar('min_quess_count', values.min_quess_count, step=self.step_num)
+            tf.summary.scalar('max_quess_count', values.max_quess_count, step=self.step_num)
+            tf.summary.scalar('winrate', values.winrate, step=self.step_num)
+        
+
+    def save_model(self, model, stat_calc_nm):
+        if not model == None:
+            values = self.__calc_values(stat_calc_nm)
+            data_str = f"\{values.average_reward:_>7.2f}avg_reward__{values.average_quess_count:_>7.2f}avg_quess_cnt__{values.winrate:_>7.2f}win_rate__{int(time.time())}.model"
+            model.save(self.save_model_path + data_str)
+
+
 env = MastermindEnv()
-agent = DQNAgent(env)
+logger = stats_logger(training = True)
+agent = DoubleDQNAgent(env, logger)
+logger.set_model(agent.model)
 
 print(agent.model.summary())
 
-episode_rewards = []
-
 for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
-    #agent.tensorboard.step = episode
     _ = env.reset()
 
     target = env.target
@@ -247,7 +325,7 @@ for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
         
         current_guess_count = env.guess_count
 
-        if np.random.random() > epsilon:
+        if np.random.random() > agent.epsilon:
             action_int = np.argmax(agent.get_qs(env_state_begin))
             action = env.int_to_array_base(action_int)
         else:
@@ -255,30 +333,11 @@ for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
         
         feedback, reward , won, done = env.step(action)
 
-        agent.update_replay_memory((env_state_begin, action_int, reward, env.state, done))
-        agent.train(done)
+        agent.add_to_replay_memory((env_state_begin, action_int, reward, env.state, done))
+        agent.train()
         
         episode_reward += reward
 
-    # Decay epsilon
-    if epsilon > MIN_EPSILON:
-        epsilon *= EPSILON_DECAY
-        epsilon = max(MIN_EPSILON, epsilon)
-    # Append episode reward to a list and log stats (every given number of episodes)
-    episode_rewards.append(episode_reward)
-    if not episode % AGGREGATE_STATS_EVERY or episode == 1:
-        average_reward = sum(episode_rewards[-AGGREGATE_STATS_EVERY:])/len(episode_rewards[-AGGREGATE_STATS_EVERY:])
-        min_reward = min(episode_rewards[-AGGREGATE_STATS_EVERY:])
-        max_reward = max(episode_rewards[-AGGREGATE_STATS_EVERY:])
-        #agent.tensorboard.update_stats(reward_avg=average_reward, reward_min=min_reward, reward_max=max_reward, epsilon=epsilon)
+    agent.end_episode()
 
-        # Save model, but only when min reward is greater or equal a set value
-        if average_reward >= MIN_REWARD:
-            agent.model.save(f'E:\IOT python env\AI\code workspace\models\{agent.model_name}__{average_reward:_>7.2f}avg_{max_reward:_>7.2f}max_{min_reward:_>7.2f}min__{int(time.time())}.model')
-        else:
-            agent.model.save(f'E:\IOT python env\AI\code workspace\models\{agent.model_name}__{average_reward:_>7.2f}avg_{max_reward:_>7.2f}max_{min_reward:_>7.2f}min__{int(time.time())}.model')
-
-    # Decay epsilon
-    if epsilon > MIN_EPSILON:
-        epsilon *= EPSILON_DECAY
-        epsilon = max(MIN_EPSILON, epsilon)
+    logger.update(won, episode_reward, env.guess_count, episode)
