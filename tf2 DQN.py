@@ -11,6 +11,8 @@ import gym_mastermind
 from tqdm import tqdm
 
 from collections import deque
+from collections import Counter
+
 from timeit import default_timer as timer
 import time
 import random
@@ -19,7 +21,7 @@ import random
 MIN_REWARD = 0.5  # For model save
 
 # Environment settings
-EPISODES = 10_000
+EPISODES = 3000#10_000
 
 # Exploration settings
 epsilon = 1  # not a constant, going to be decayed
@@ -33,45 +35,94 @@ AGGREGATE_STATS_EVERY = 50  # episodes
 random.seed(1)
 np.random.seed(1)
 
-# Own Tensorboard class speeds up TensorBoard for DQN
-class ModifiedTensorBoard(tf.keras.callbacks.TensorBoard):
 
-    # Overriding init to set initial step and writer (we want one log file for all .fit() calls)
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.step = 1
-        self._log_write_dir = self.log_dir
-        self.writer = tf.summary.create_file_writer(self.log_dir)
+class MastermindEnv():
+    """
+    Guess a 4-digits long password where each digit is between 0 and 5.
 
-    # Overriding this method to stop creating default log writer
-    def set_model(self, model):
-        pass
+    After each step the agent is provided with a 4-digits long tuple:
+    - '2' indicates that a digit has been correclty guessed at the correct position.
+    - '1' indicates that a digit has been correclty guessed but the position is wrong.
+    - '0' otherwise.
 
-    # Overrided, saves logs with our step number
-    # (otherwise every .fit() will start writing from 0th step)
-    def on_epoch_end(self, epoch, logs=None):
-        self.update_stats(**logs)
+    The rewards at the end of the episode are:
+    0 if the agent's guess is incorrect
+    1 if the agent's guess is correct
 
-    # Overrided
-    # We train for one batch only, no need to save anything at epoch end
-    def on_batch_end(self, batch, logs=None):
-        pass
+    The episode terminates after the agent guesses the target or
+    12 steps have been taken.
+    """
 
-    # Overrided, so won't close writer
-    def on_train_end(self, _):
-        pass
+    def __init__(self):
+        self.code_values = 6
+        self.code_lenght = 2
+        self.feedback_values = 3
+        self.guess_max = 12
 
-    def _write_logs(self, logs, index):
-        with self.writer.as_default():
-            for name, value in logs.items():
-                tf.summary.scalar(name, value, step=index)
-                self.step += 1
-                self.writer.flush()
+        self.state = np.full([2,self.guess_max,self.code_lenght], -1, dtype="float64")
 
-    # Custom method for saving own metrics
-    # Creates writer, writes custom metrics and closes writer
-    def update_stats(self, **stats):
-        self._write_logs(stats, self.step)
+        self.reward_best = (self.code_lenght*self.feedback_values-1)*3
+        self.reward_worst = - (self.code_lenght*self.feedback_values-1)*2
+        
+        self.target = None
+        self.guess_count = None
+        self.feedback = None
+
+        self.reset()
+
+    def __get_observation(self, action):
+        """
+        returns:
+            feedback array : lenght = self.code_lenght
+            reward int: 1 for color, 2 for color and position
+            won bool: is True when action is self.target
+        """
+        match_idxs = set(idx for idx, ai in enumerate(action) if ai == self.target[idx])
+        n_correct = len(match_idxs)
+        g_counter = Counter(self.target[idx] for idx in range(self.code_lenght) if idx not in match_idxs)
+        a_counter = Counter(action[idx] for idx in range(self.code_lenght) if idx not in match_idxs)
+        n_white = sum(min(g_count, a_counter[k])for k, g_count in g_counter.items())
+
+        return (
+            np.array([0] * (self.code_lenght - n_correct - n_white) + [1] * n_white + [2] * n_correct),
+            1 * n_white + 2 * n_correct,
+            len(match_idxs) == self.code_lenght
+        )
+
+
+    def step(self, action):
+        self.guess_count += 1
+        self.state
+        feedback, reward, won = self.__get_observation(action)
+
+        done = won == True or self.guess_count >= self.guess_max
+
+        if won:
+            reward = self.reward_best
+        elif any(np.array_equal(x, action/(self.code_values-1)) for x in self.state[0]):
+            reward = self.reward_worst
+
+        self.state[0,self.guess_count-1] = action/(self.code_values-1)
+        self.state[1,self.guess_count-1] = feedback/(self.feedback_values-1)
+        return feedback, reward , won, done
+
+
+    def reset(self):
+        self.target, _ = self.random_code()
+        self.guess_count = 0
+        self.feedback = np.zeros(self.code_lenght, dtype = int)
+        return self.feedback
+
+
+    def random_code(self):
+        action_int = np.random.randint(0, self.code_values**self.code_lenght-1)
+        return  self.int_to_array_base(action_int), action_int
+
+
+    def int_to_array_base(self, int_base_10):
+        int_base_ = np.base_repr(int_base_10, self.code_values)
+        result  = np.array(list(map(int,str(int_base_))))
+        return np.pad(result, [self.code_lenght-len(result),0],constant_values=0)
 
 
 class DQNAgent():
@@ -87,20 +138,16 @@ class DQNAgent():
 
         self.replay_memory = deque(maxlen = self.replay_mem_size)
 
-        #self.tensorboard = ModifiedTensorBoard(log_dir=f"logs/{self.model_name}-{int(time.time())}")
-
         self.target_update_counter = 0
 
 
     def create_model(self, env):
         self.model_name = "f_d128_d256_dout"
         model = tf.keras.models.Sequential()
-        model.add(tf.keras.layers.Flatten(input_shape=(2,env.guess_max,env.size)))#(2, 12, 4)#(2,env.guess_max,env.size)
-        model.add(tf.keras.layers.Dense(2*env.guess_max*env.size, activation='relu'))
-        model.add(tf.keras.layers.Dense(env.values**env.size*2, activation='relu'))
-        model.add(tf.keras.layers.Dense(env.values**env.size, activation='linear'))
-
-        #model.compile(optimizer="adam", loss=tf.keras.losses.MeanAbsoluteError()
+        model.add(tf.keras.layers.Flatten(input_shape=(2,env.guess_max,env.code_lenght)))#(2, 12, 4)#(2,env.guess_max,env.size)
+        model.add(tf.keras.layers.Dense(2*env.guess_max*env.code_lenght, activation='relu'))
+        model.add(tf.keras.layers.Dense(env.code_values**env.code_lenght*2, activation='relu'))
+        model.add(tf.keras.layers.Dense(env.code_values**env.code_lenght, activation='linear'))
 
         adam = tf.optimizers.Adam(lr=self.learning_rate)
 
@@ -133,30 +180,30 @@ class DQNAgent():
         batch = random.sample(self.replay_memory, self.batch_size)
 
         #create new Q lists
-        current_states = np.array([transition[0] for transition in batch])
-        current_qs_list = self.model.predict(current_states)
+        begin_states = np.array([transition[0] for transition in batch])
+        qs_list = self.model.predict(begin_states)
 
-        new_current_states = np.array([transition[3] for transition in batch])
-        future_qs_list = self.target_model.predict(new_current_states)
+        end_states = np.array([transition[3] for transition in batch])
+        future_qs_list = self.target_model.predict(end_states)
+
+        next_actions = np.argmax(self.model.predict(end_states), axis=1)
 
         #create X,Y for model.fit
         X = []
         Y = []
 
         #fill x and y lists with Q values en states
-        for index, (current_state, action, reward, new_current_state, done) in enumerate(batch):
+        for index, (begin_state, action, reward, end_state, done) in enumerate(batch):
             if not done:
-                max_future_q = np.max(future_qs_list[index])
+                max_future_q = future_qs_list[index, next_actions[index]]#np.max(future_qs_list[index])
                 new_q = reward + self.discount * max_future_q
-                # if index == 1:
-                #     print(f"new_q: {new_q} = reward: {reward} + discounted future reward: {self.discount * max_future_q}")
             else:
                 new_q = reward
             
-            current_qs = current_qs_list[index]
+            current_qs = qs_list[index]
             current_qs[action] = new_q
 
-            X.append(current_state)
+            X.append(begin_state)
             Y.append(current_qs)
 
         #fit model to new Q values
@@ -178,40 +225,16 @@ class DQNAgent():
             self.target_update_counter = 0
 
 
-def int_to_array_base(int_base_10, base, array_length):
-    int_base_ = np.base_repr(int_base_10, base)
-    result  = np.array(list(map(int,str(int_base_))))
-    return np.pad(result, [array_length-len(result),0],constant_values=0)
-
-
-def array_to_reward(array):
-    array_str = ''.join(map(str, array))
-    ocur_1 = array_str.count('1')
-    ocur_2 = array_str.count('2')
-    return ocur_1 + ocur_2*2
-
-
-def is_row_in_array(row, array):
-    row = np.array(row, dtype="float32")
-    array = np.array(array, dtype="float32")
-    ans = any(np.array_equal(x, row) for x in array)
-    return ans
-
-
-env = gym.make('Mastermind-v0') 
+env = MastermindEnv()
 agent = DQNAgent(env)
 
 print(agent.model.summary())
 
 episode_rewards = []
-reward_best = (3**env.size-1)
-reward_worst = -(3**env.size-1)
 
 for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
     #agent.tensorboard.step = episode
     _ = env.reset()
-
-    env_state_end = np.full([2,env.guess_max,env.size], -1)
 
     target = env.target
 
@@ -220,30 +243,19 @@ for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
     done = False
 
     while not done:
-        env_state_begin = env_state_end.copy()
+        env_state_begin = env.state.copy()
         
         current_guess_count = env.guess_count
 
         if np.random.random() > epsilon:
-            action = np.argmax(agent.get_qs(env_state_begin))
+            action_int = np.argmax(agent.get_qs(env_state_begin))
+            action = env.int_to_array_base(action_int)
         else:
-            action = np.random.randint(0, env.values**env.size-1)
-
-        action_env = int_to_array_base(action, env.values, env.size)
+            action, action_int = env.random_code()
         
-        env_state_end[0,current_guess_count] = np.array(action_env)/(env.values-1)
-        feedback,won,done,_ = env.step(list(action_env))
-        env_state_end[1,current_guess_count] = np.array(feedback)/2
+        feedback, reward , won, done = env.step(action)
 
-        if won:
-            reward = reward_best*2
-        else:
-            if is_row_in_array(action_env/(env.values-1), env_state_begin[0]):
-                reward = reward_worst
-            else:
-                reward = array_to_reward(feedback)
-
-        agent.update_replay_memory((env_state_begin, action, reward, env_state_end, done))
+        agent.update_replay_memory((env_state_begin, action_int, reward, env.state, done))
         agent.train(done)
         
         episode_reward += reward
