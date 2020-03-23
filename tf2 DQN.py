@@ -2,6 +2,7 @@ import numpy as np
 
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+#os.environ['TF_CONFIG'] = json.dumps({'cluster': {'worker': ['X.X.X.X:2000', 'X.X.X.X:2000']}, 'task': {'type': 'worker', 'index': 0}})
 
 import tensorflow as tf
 #tf.get_logger().setLevel('ERROR')
@@ -16,14 +17,63 @@ import datetime
 import time
 import random
 
+print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
+#tf.debugging.set_log_device_placement(True)
+
+
 
 # Environment settings
-EPISODES = 4000#10_000
+model_name = "2*6_120-000_#2"
+training_EPISODES = 120_000#120_000
+eval_every = 5
+eval_every_for = 50
+
+evaluation_EPISODES = 2_000
 
 
 # For more repetitive results
 random.seed(1)
 np.random.seed(1)
+
+# Own Tensorboard class speeds up TensorBoard for DQN
+class ModifiedTensorBoard(tf.keras.callbacks.TensorBoard):
+
+    # Overriding init to set initial step and writer (we want one log file for all .fit() calls)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.step = 1
+        self._log_write_dir = self.log_dir
+        self.writer = tf.summary.create_file_writer(self.log_dir)
+
+    # Overriding this method to stop creating default log writer
+    def set_model(self, model):
+        pass
+
+    # Overrided, saves logs with our step number
+    # (otherwise every .fit() will start writing from 0th step)
+    def on_epoch_end(self, epoch, logs=None):
+        self.update_stats(**logs)
+
+    # Overrided
+    # We train for one batch only, no need to save anything at epoch end
+    def on_batch_end(self, batch, logs=None):
+        pass
+
+    # Overrided, so won't close writer
+    def on_train_end(self, _):
+        pass
+
+    def _write_logs(self, logs, index):
+        with self.writer.as_default():
+            for name, value in logs.items():
+                tf.summary.scalar(name, value, step=index)
+                self.step += 1
+                self.writer.flush()
+
+    # Custom method for saving own metrics
+    # Creates writer, writes custom metrics and closes writer
+    def update_stats(self, **stats):
+        self._write_logs(stats, self.step)
 
 
 class MastermindEnv():
@@ -45,12 +95,11 @@ class MastermindEnv():
 
     def __init__(self):
         self.code_values = 6
-        self.code_lenght = 4
+        self.code_lenght = 2
         self.feedback_values = 3
         self.guess_max = 12
 
         self.reward_best = (self.code_lenght*self.feedback_values-1)*3
-        self.reward_worst = - (self.code_lenght*self.feedback_values-1)*2
         
         self.state = None
         self.target = None
@@ -58,6 +107,7 @@ class MastermindEnv():
         self.feedback = None
 
         self.reset()
+
 
     def __get_observation(self, action):
         """
@@ -94,9 +144,9 @@ class MastermindEnv():
             reward = self.reward_best
         #checks for duplicate actions
         elif np.any(np.all(np.isin(self.state[0][:self.guess_count-1],action/(self.code_values-1)), axis = 1)):
-            reward = -0
+            reward = -1
 
-        return feedback, reward , won, done
+        return reward , won, done
 
 
     def reset(self):
@@ -104,7 +154,6 @@ class MastermindEnv():
         self.guess_count = 0
         self.state = np.full([2,self.guess_max,self.code_lenght], -1, dtype="float64")
         self.feedback = np.zeros(self.code_lenght, dtype = int)
-        return self.feedback
 
 
     def random_code(self):
@@ -121,19 +170,25 @@ class MastermindEnv():
 class DoubleDQNAgent():
     def __init__(self, env, logger):
         #set training values
-        self.min_replay_mem_size = 1_000
-        self.batch_size = 64
-        self.replay_mem_size = 50_000
-        self.update_target_every = 5
-        self.discount = 0.2
-        self.learning_rate = 0.0001
+        self.train_every = 10
+        self.min_replay_mem_size = 2_000
+        self.replay_mem_size = 40_000
+        #training parms
+        self.update_target_every = self.train_every*25
+        self.discount = 0.5
+        self.learning_rate = 0.001
         self.epsilon = 1
-        self.EPSILON_DECAY = 0.99975
-        self.MIN_EPSILON = 0.001
+        self.EPSILON_DECAY = 0.99997
+        self.MIN_EPSILON = 0.01
+        self.batch_size = 32
+
+        self.training_sample_size = self.batch_size*self.train_every*2
+        self.validation_sample_size = self.batch_size*round(self.train_every*0.3)
+
 
         #main model
         self.model = self.create_model(env)
-
+        
         #the future q prediction model
         self.target_model = self.create_model(env)
         self.target_model.set_weights(self.model.get_weights())
@@ -142,16 +197,14 @@ class DoubleDQNAgent():
         self.replay_memory = deque(maxlen = self.replay_mem_size)
 
         self.target_update_counter = 0
-        #self.tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=logger.train_log_dir.replace("/", "\\")+ "\\fit", histogram_freq=50, )
-
+        self.tensorboard_callback = ModifiedTensorBoard(log_dir=logger.train_log_dir+ "fit")#, update_freq = "batch")#, histogram_freq=1, ) #.replace("/", "\\")+ "fit"
 
 
     def create_model(self, env):
-        self.model_name = "f_d128_d256_dout"
         model = tf.keras.models.Sequential()
         model.add(tf.keras.layers.Flatten(input_shape=(2,env.guess_max,env.code_lenght)))
         model.add(tf.keras.layers.Dense(2*env.guess_max*env.code_lenght, activation='relu'))
-        model.add(tf.keras.layers.Dense(env.code_values**env.code_lenght*2, activation='relu'))
+        #model.add(tf.keras.layers.Dense(env.code_values**env.code_lenght*2, activation='relu'))
         model.add(tf.keras.layers.Dense(env.code_values**env.code_lenght, activation='linear'))
 
         adam = tf.optimizers.Adam(lr=self.learning_rate)
@@ -167,10 +220,10 @@ class DoubleDQNAgent():
 
     def get_qs(self, state):
         """
-        call for with only state
-        returns a list whit q values for that state
+        call for with only one state
+        returns a list white q values for that state
         """
-        return self.model.predict(np.expand_dims(state, 0))[0]
+        return np.squeeze(self.model.predict_on_batch(state[None, :]))
 
 
     def train(self):
@@ -178,24 +231,24 @@ class DoubleDQNAgent():
         if len(self.replay_memory) < self.min_replay_mem_size:
             return
         
-        batch = random.sample(self.replay_memory, self.batch_size)
+        samples = random.sample(self.replay_memory, self.training_sample_size + self.validation_sample_size)
 
         #create new Q lists
-        begin_states = np.array([transition[0] for transition in batch])
-        qs_list = self.model.predict(begin_states)
+        begin_states = np.array([transition[0] for transition in samples])
+        qs_list = np.array(self.model.predict_on_batch(begin_states))
 
-        end_states = np.array([transition[3] for transition in batch])
-        future_qs_list = self.target_model.predict(end_states)
+        end_states = np.array([transition[3] for transition in samples])
+        future_qs_list = np.array(self.target_model.predict_on_batch(end_states))
 
         #predict which action to take for the end state (used to calulate future q)
         next_actions = np.argmax(self.model.predict(end_states), axis=1)
 
         #create X,Y for model.fit
-        X = []
-        Y = []
+        samples_X = []
+        samples_Y = []
 
         #fill x and y lists with Q values en states
-        for index, (begin_state, action, reward, end_state, done) in enumerate(batch):
+        for index, (begin_state, action, reward, end_state, done) in enumerate(samples):
             if not done:
                 future_q = future_qs_list[index, next_actions[index]]
                 new_q = reward + self.discount * future_q
@@ -205,14 +258,20 @@ class DoubleDQNAgent():
             current_qs = qs_list[index]
             current_qs[action] = new_q
 
-            X.append(begin_state)
-            Y.append(current_qs)
+            samples_X.append(begin_state)
+            samples_Y.append(current_qs)
+
+        training_X, training_Y = np.array(samples_X[:-self.validation_sample_size]), np.array(samples_Y[:-self.validation_sample_size])
+        validation_X, validation_Y = np.array(samples_X[-self.validation_sample_size:]), np.array(samples_Y[-self.validation_sample_size:])
+
+        #print(f"byte size training_X: {training_X.nbytes}, training_Y: {training_Y.nbytes}, validation_X: {validation_X.nbytes}, validation_Y: {validation_Y.nbytes}")
 
         #fit model to new Q values
-        self.model.fit(np.array(X), np.array(Y),
+        self.model.fit(training_X, training_Y,
             batch_size = self.batch_size,
             verbose = 0,
-            shuffle = False#,
+            shuffle = False,
+            validation_data=(validation_X, validation_Y)
             #callbacks=[self.tensorboard_callback]
         )
 
@@ -230,26 +289,29 @@ class DoubleDQNAgent():
 
 
 class stats_logger():
-    def __init__(self, training):
+    def __init__(self, training, model_name = None):
         self.training = training
-        self.model = None
         self.AGGREGATE_STATS_EVERY = 50
-        self.save_model_path = "E:\IOT python env\AI\code workspace\models"
-        self.train_log_dir = 'E:/IOT python env/AI/code workspace/logs/train/' + datetime.datetime.now().strftime("%m%d-%H%M%S")
-        self.test_log_dir = 'E:/IOT python env/AI/code workspace/logs/test/' + datetime.datetime.now().strftime("%m%d-%H%M%S")
+        if model_name is None:
+            self.save_model_path = f"/home/martijn/python/models/{datetime.datetime.now().strftime('%m%d-%H_%M_%S')}/" 
+            self.train_log_dir = f"/home/martijn/python/logs/train/{datetime.datetime.now().strftime('%m%d-%H_%M_%S')}/"
+            self.test_log_dir = f"/home/martijn/python/logs/test/{datetime.datetime.now().strftime('%m%d-%H_%M_%S')}/"
+        else: 
+            self.save_model_path = f"/home/martijn/python/models/{model_name}/" 
+            self.train_log_dir = f"/home/martijn/python/logs/train/{model_name}/"
+            self.test_log_dir = f"/home/martijn/python/logs/test/{model_name}/"
         self.set_writer(training)
+        try:
+            os.mkdir(f"{self.save_model_path}")
+        except:
+            pass
 
-
-
+        self.best_values = None
         self.episode_rewards = []
         self.end_quess_counts = []
         self.win_count = []
         self.step_num = 0
         self.return_values = namedtuple("return_values", ["average_reward","min_reward","max_reward","average_quess_count","min_quess_count","max_quess_count","winrate"])
-
-
-    def set_model(self, model):
-        self.model = model
 
 
     def set_writer(self, training):
@@ -260,15 +322,13 @@ class stats_logger():
             self.summary_writer = tf.summary.create_file_writer(self.test_log_dir)
 
 
-    def update(self,won, reward, quess_count, episode):
+    def update(self,won, reward, quess_count, episode, epsilon):
         self.step_num += 1
         self.episode_rewards.append(reward)
         self.end_quess_counts.append(quess_count)
         self.win_count.append(won)
         if not episode % self.AGGREGATE_STATS_EVERY or episode == 1:
-            self.write_to_file(self.AGGREGATE_STATS_EVERY)
-            if self.training:
-                self.save_model(self.model, self.AGGREGATE_STATS_EVERY)
+            self.write_to_file(self.AGGREGATE_STATS_EVERY, epsilon)
 
 
     def __calc_values(self, num_episodes):
@@ -285,7 +345,7 @@ class stats_logger():
         return self.return_values(average_reward,min_reward,max_reward,average_quess_count,min_quess_count,max_quess_count,winrate)
 
 
-    def write_to_file(self, stat_calc_nm):
+    def write_to_file(self, stat_calc_nm, epsilon):
         with self.summary_writer.as_default():
             values = self.__calc_values(stat_calc_nm)
             tf.summary.scalar('average_reward', values.average_reward, step=self.step_num)
@@ -295,49 +355,107 @@ class stats_logger():
             tf.summary.scalar('min_quess_count', values.min_quess_count, step=self.step_num)
             tf.summary.scalar('max_quess_count', values.max_quess_count, step=self.step_num)
             tf.summary.scalar('winrate', values.winrate, step=self.step_num)
+            if self.training:
+                tf.summary.scalar('epsilon', epsilon, step=self.step_num)
         
 
     def save_model(self, model, stat_calc_nm):
-        if not model == None:
-            values = self.__calc_values(stat_calc_nm)
-            data_str = f"\{values.average_reward:_>7.2f}avg_reward__{values.average_quess_count:_>7.2f}avg_quess_cnt__{values.winrate:_>7.2f}win_rate__{int(time.time())}.model"
+        values = self.__calc_values(stat_calc_nm)
+        save_model = False
+
+        if self.best_values is None:
+            self.best_values = np.array(values)
+
+        bigger_index = np.where(values > self.best_values)
+        smaller_index = np.where(values < self.best_values)
+
+        for index in np.where(np.isin(bigger_index, [0, 1, 2, 6]) == True, bigger_index, None)[0]:
+            if not index == None:
+                self.best_values[index] = values[index]
+                save_model = True
+
+        for index in np.where(np.isin(smaller_index, [3, 5]) == True, smaller_index, None)[0]:
+            if not index == None:
+                self.best_values[index] = values[index]
+                save_model = True
+
+        if save_model == True:
+            data_str = f"{self.step_num}_{values.average_reward:_>7.2f}avg_reward_{values.average_quess_count:_>7.2f}avg_quess_cnt_{values.winrate:_>7.2f}win_rate.h5"
             model.save(self.save_model_path + data_str)
 
 
+def game_loop(env, agent, logger, episode, training):
+
+        env.reset()
+        episode_reward, done = 0, False
+
+        while not done:
+            env_state_begin = env.state.copy()
+
+            if training and np.random.random() > agent.epsilon:
+                action, action_int = env.random_code()
+            else:
+                action_int = np.argmax(agent.get_qs(env_state_begin))
+                action = env.int_to_array_base(action_int)
+            
+            reward , won, done = env.step(action)
+
+            if training:
+                agent.add_to_replay_memory((env_state_begin, action_int, reward, env.state, done))
+            
+            episode_reward += reward
+
+        logger.update(won, episode_reward, env.guess_count, episode, agent.epsilon)
+
 env = MastermindEnv()
-logger = stats_logger(training = True)
-agent = DoubleDQNAgent(env, logger)
-logger.set_model(agent.model)
+tr_logger = stats_logger(training = True, 
+    model_name=model_name
+)
+eval_logger = stats_logger(training = False,
+    model_name=model_name
+)
+agent = DoubleDQNAgent(env, tr_logger)
 
 print(agent.model.summary())
 
-for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
-    _ = env.reset()
+eval_cnt= 0
 
-    target = env.target
-
-    episode_reward = 0
-
-    done = False
-
-    while not done:
-        env_state_begin = env.state.copy()
-        
-        current_guess_count = env.guess_count
-
-        if np.random.random() > agent.epsilon:
-            action_int = np.argmax(agent.get_qs(env_state_begin))
-            action = env.int_to_array_base(action_int)
-        else:
-            action, action_int = env.random_code()
-        
-        feedback, reward , won, done = env.step(action)
-
-        agent.add_to_replay_memory((env_state_begin, action_int, reward, env.state, done))
-        agent.train()
-        
-        episode_reward += reward
-
+for episode in tqdm(range(1, training_EPISODES + 1), ascii=True, unit="tr_epidode"):
+    game_loop(
+        env = env, 
+        agent = agent, 
+        logger= tr_logger,
+        episode = episode,
+        training = True
+    )
     agent.end_episode()
+    if not episode % agent.train_every:
+        agent.train()
 
-    logger.update(won, episode_reward, env.guess_count, episode)
+    if not episode % eval_every:
+        eval_logger.step_num = episode
+        eval_cnt += 1
+        game_loop(
+            env = env, 
+            agent = agent, 
+            logger= eval_logger,
+            episode = episode,
+            training = False
+        )
+        if not eval_cnt % eval_every_for//2:
+            eval_logger.save_model(agent.model, eval_every_for)
+
+print("model evalution timeeee!!!")
+
+eval_logger.safe_model=False
+
+for episode in tqdm(range(1, evaluation_EPISODES + 1), ascii=True, unit="eval_epidode"):
+    game_loop(
+        env = env, 
+        agent = agent, 
+        logger= eval_logger,
+        episode = episode,
+        training = False
+    )
+
+eval_logger.save_model(agent.model, eval_every_for)
